@@ -9,6 +9,11 @@ ACONEX_OAUTH_BASE = "https://constructionandengineering.oraclecloud.com/auth"
 
 app = FastAPI(title="Aconex MCP Minimal", version="1.0.0")
 
+@app.get("/")
+@app.head("/")
+def root():
+    return {"ok": True, "service": "aconex-mcp"}
+
 @app.get("/oauth/authorize")
 async def oauth_authorize(request: Request):
     return RedirectResponse(
