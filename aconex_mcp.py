@@ -1,5 +1,5 @@
 from typing import Optional
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response, Query
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os, requests, xmltodict, httpx
@@ -17,10 +17,14 @@ ACONEX_OAUTH_BASE = os.getenv(
 # Proyecto por defecto (para no tener que pasar projectId en cada llamada)
 DEFAULT_PROJECT_ID = os.getenv("ACONEX_DEFAULT_PROJECT_ID")   # ej: 1207982555
 
+def _default_project_id() -> Optional[str]:
+    """Helper para mostrar en /healthz qué valor está leyendo el server."""
+    return os.getenv("ACONEX_DEFAULT_PROJECT_ID")
+
 # ==========================
 # App
 # ==========================
-app = FastAPI(title="Aconex MCP Minimal", version="1.1.0")
+app = FastAPI(title="Aconex MCP", version="1.1.0")
 
 # CORS abierto (el agente de ChatGPT llama desde otra URL)
 app.add_middleware(
@@ -72,7 +76,11 @@ def root():
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "aconex_base": ACONEX_BASE}
+    return {
+        "ok": True,
+        "aconex_base": ACONEX_BASE,
+        "default_project": _default_project_id(),  # <-- ahora sí existe
+    }
 
 # ==========================
 # OAuth proxy (mismo dominio que tu API)
@@ -110,12 +118,12 @@ async def oauth_token(request: Request):
 # ==========================
 @app.get("/search_register")
 def search_register(
-    projectId: Optional[str] = None,
+    projectId: str | None = Query(default=None),
     page_number: int = 1,
     page_size: int = 50,
-    search_query: Optional[str] = None,
+    search_query: str | None = None,
     return_fields: str = "docno,title,statusid,revision,registered",
-    authorization: Optional[str] = Header(default=None),
+    authorization: str | None = Header(default=None),
 ):
     auth = _bearer_or_401(authorization)
     projectId = _effective_project_id(projectId)
@@ -198,5 +206,3 @@ def download_file(
             "Content-Disposition": f'attachment; filename="{fname or (documentId + ".bin")}"'
         },
     )
-
-
