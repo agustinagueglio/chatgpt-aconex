@@ -9,6 +9,27 @@ ACONEX_OAUTH_BASE = "https://constructionandengineering.oraclecloud.com/auth"
 
 app = FastAPI(title="Aconex MCP Minimal", version="1.0.0")
 
+@app.get("/oauth/authorize")
+async def oauth_authorize(request: Request):
+    return RedirectResponse(
+        f"{ACONEX_OAUTH_BASE}/authorize?{request.query_params}",
+        status_code=302
+    )
+
+@app.post("/oauth/token")
+async def oauth_token(request: Request):
+    body = await request.body()
+    fwd_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if "authorization" in request.headers:
+        fwd_headers["Authorization"] = request.headers["authorization"]
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(f"{ACONEX_OAUTH_BASE}/token",
+                              headers=fwd_headers, content=body)
+
+    return Response(content=r.content, status_code=r.status_code,
+                    media_type=r.headers.get("content-type", "application/json"))
+
 @app.on_event("startup")
 async def on_startup():
     # Para ver en el log QUÉ archivo cargó Uvicorn
