@@ -1,65 +1,78 @@
 # aconex_mcp.py
-from typing import Optional
-import os
-import requests
-import xmltodict
-import httpx
+from __future__ import annotations
+from typing import Optional, Dict, Any
+from time import time
 
-from fastapi import (
-    FastAPI, Header, HTTPException, Request, Response, Query
-)
-from fastapi.responses import (
-    JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse
-)
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-
+import os, requests, xmltodict
+import httpx
 
 # ==========================
 # Config por variables de entorno
 # ==========================
 ACONEX_BASE = os.getenv("ACONEX_BASE", "https://us1.aconex.com/api").rstrip("/")
+# Token endpoint de Oracle/IDCS (no cambiar dominio)
 ACONEX_OAUTH_BASE = os.getenv(
     "ACONEX_OAUTH_BASE",
     "https://constructionandengineering.oraclecloud.com/auth"
 ).rstrip("/")
-DEFAULT_PROJECT_ID = os.getenv("ACONEX_DEFAULT_PROJECT_ID")  # ej: "1207982555"
 
+# Credenciales para client_credentials (ponerlas en Render)
+ACONEX_CLIENT_ID = os.getenv("ACONEX_CLIENT_ID", "")
+ACONEX_CLIENT_SECRET = os.getenv("ACONEX_CLIENT_SECRET", "")
+# Scope opcional; muchas veces no hace falta. Dejar vacío si tu IDCS no lo requiere.
+ACONEX_SCOPE = os.getenv("ACONEX_SCOPE", "").strip()
 
-# ==========================
-# App
-# ==========================
-app = FastAPI(title="Aconex MCP", version="1.2.0")
-
-# CORS abierto para que el builder/acción de ChatGPT pueda llamar
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
-
+# Proyecto por defecto
+DEFAULT_PROJECT_ID = os.getenv("ACONEX_DEFAULT_PROJECT_ID")
 
 # ==========================
-# Utilidades
+# Token cache simple en memoria
 # ==========================
-def _bearer_or_401(authorization: Optional[str]):
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <token>")
-    return authorization
+_TOKEN: Dict[str, Any] = {"value": None, "exp": 0}
 
+async def _get_access_token() -> str:
+    """
+    Pide/renueva un token por client_credentials y lo cachea.
+    """
+    now = time()
+    if _TOKEN["value"] and _TOKEN["exp"] - now > 60:
+        return _TOKEN["value"]
 
-def _effective_project_id(projectId: Optional[str]) -> str:
-    if projectId:
-        return projectId
+    if not ACONEX_CLIENT_ID or not ACONEX_CLIENT_SECRET:
+        raise HTTPException(500, "Falta configurar ACONEX_CLIENT_ID / ACONEX_CLIENT_SECRET en Render")
+
+    data = {"grant_type": "client_credentials"}
+    if ACONEX_SCOPE:
+        data["scope"] = ACONEX_SCOPE
+
+    # Basic auth con client_id:client_secret
+    auth = (ACONEX_CLIENT_ID, ACONEX_CLIENT_SECRET)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(f"{ACONEX_OAUTH_BASE}/token", data=data, auth=auth)
+    if r.status_code != 200:
+        raise HTTPException(502, f"Token error {r.status_code}: {r.text}")
+
+    tok = r.json()
+    access = tok.get("access_token")
+    if not access:
+        raise HTTPException(502, "Token sin access_token")
+    expires_in = int(tok.get("expires_in", 1800))
+    _TOKEN["value"] = access
+    _TOKEN["exp"] = now + expires_in
+    return access
+
+def _effective_project_id(pid: Optional[str]) -> str:
+    if pid:
+        return pid
     if DEFAULT_PROJECT_ID:
         return DEFAULT_PROJECT_ID
-    raise HTTPException(
-        status_code=400,
-        detail="Falta projectId y no hay ACONEX_DEFAULT_PROJECT_ID configurado en el servidor."
-    )
-
+    raise HTTPException(400, "Falta projectId y no hay ACONEX_DEFAULT_PROJECT_ID configurado")
 
 def _as_json(resp: requests.Response):
-    # Si Aconex devuelve JSON lo propagamos; si devuelve XML lo convertimos
     ctype = (resp.headers.get("Content-Type") or "").lower()
     if "application/json" in ctype:
         try:
@@ -67,80 +80,55 @@ def _as_json(resp: requests.Response):
         except Exception:
             data = {"raw": resp.text}
         return JSONResponse(data, status_code=resp.status_code)
-
     try:
         data = xmltodict.parse(resp.text)
     except Exception:
         return PlainTextResponse(resp.text, status_code=resp.status_code)
     return JSONResponse(data, status_code=resp.status_code)
 
+# ==========================
+# App
+# ==========================
+app = FastAPI(title="Aconex MCP", version="2.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
 
 # ==========================
-# Rutas básicas
+# Rutas utilitarias
 # ==========================
 @app.get("/")
 @app.head("/")
 def root():
     return {"ok": True, "service": "aconex-mcp"}
 
+@app.get("/favicon.ico")
+def favicon():
+    return PlainTextResponse("", status_code=204)
 
 @app.get("/healthz")
 def healthz():
     return {
         "ok": True,
         "aconex_base": ACONEX_BASE,
-        "default_project": DEFAULT_PROJECT_ID,
+        "default_project": DEFAULT_PROJECT_ID
     }
 
-
 # ==========================
-# Proxy OAuth (mismo dominio raíz que tu API en Render)
-# ==========================
-@app.get("/oauth/authorize")
-async def oauth_authorize(request: Request):
-    # Redirige a Oracle manteniendo todos los query params (client_id, redirect_uri, scope, etc.)
-    qs = str(request.query_params)
-    dest = f"{ACONEX_OAUTH_BASE}/authorize"
-    if qs:
-        dest = f"{dest}?{qs}"
-    return RedirectResponse(dest, status_code=302)
-
-
-@app.post("/oauth/token")
-async def oauth_token(request: Request):
-    # Reenvía tal cual el body y la cabecera Authorization (Basic client_id:secret)
-    body = await request.body()
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    auth = request.headers.get("authorization")
-    if auth:
-        headers["Authorization"] = auth
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(f"{ACONEX_OAUTH_BASE}/token", headers=headers, content=body)
-
-    return Response(
-        content=r.content,
-        status_code=r.status_code,
-        media_type=r.headers.get("content-type", "application/json"),
-    )
-
-
-# ==========================
-# Endpoints del conector (con alias de ruta)
+# Endpoints que llaman a Aconex (sin Bearer del cliente)
 # ==========================
 @app.get("/search_register")
-@app.get("/search_register/")
-@app.get("/searchRegister")
-def search_register(
+async def search_register(
     projectId: Optional[str] = Query(default=None),
     page_number: int = 1,
     page_size: int = 50,
     search_query: Optional[str] = None,
     return_fields: str = "docno,title,statusid,revision,registered",
-    authorization: Optional[str] = Header(default=None),
 ):
-    auth = _bearer_or_401(authorization)
-    projectId = _effective_project_id(projectId)
+    token = await _get_access_token()
+    pid = _effective_project_id(projectId)
 
     params = {
         "search_type": "PAGED",
@@ -151,69 +139,47 @@ def search_register(
     if search_query:
         params["search_query"] = search_query
 
-    url = f"{ACONEX_BASE}/projects/{projectId}/register"
+    url = f"{ACONEX_BASE}/projects/{pid}/register"
     resp = requests.get(
         url,
-        headers={"Authorization": auth, "Accept": "application/json"},
-        params=params,
-        timeout=60,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        params=params, timeout=60
     )
     return _as_json(resp)
-
 
 @app.get("/register_schema")
-@app.get("/registerSchema")
-def register_schema(
-    projectId: Optional[str] = Query(default=None),
-    authorization: Optional[str] = Header(default=None),
-):
-    auth = _bearer_or_401(authorization)
-    projectId = _effective_project_id(projectId)
-
-    url = f"{ACONEX_BASE}/projects/{projectId}/register/schema"
+async def register_schema(projectId: Optional[str] = None):
+    token = await _get_access_token()
+    pid = _effective_project_id(projectId)
+    url = f"{ACONEX_BASE}/projects/{pid}/register/schema"
     resp = requests.get(
         url,
-        headers={"Authorization": auth, "Accept": "application/json"},
-        timeout=60,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=60
     )
     return _as_json(resp)
-
 
 @app.get("/document_metadata")
-@app.get("/documentMetadata")
-def document_metadata(
-    projectId: Optional[str] = Query(default=None),
-    documentId: str = "",
-    authorization: Optional[str] = Header(default=None),
-):
-    auth = _bearer_or_401(authorization)
-    projectId = _effective_project_id(projectId)
-
-    url = f"{ACONEX_BASE}/projects/{projectId}/register/{documentId}/metadata"
+async def document_metadata(projectId: Optional[str] = None, documentId: str = ""):
+    token = await _get_access_token()
+    pid = _effective_project_id(projectId)
+    url = f"{ACONEX_BASE}/projects/{pid}/register/{documentId}/metadata"
     resp = requests.get(
         url,
-        headers={"Authorization": auth, "Accept": "application/json"},
-        timeout=60,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=60
     )
     return _as_json(resp)
 
-
 @app.get("/download_file")
-@app.get("/downloadFile")
-def download_file(
-    projectId: Optional[str] = Query(default=None),
-    documentId: str = "",
-    authorization: Optional[str] = Header(default=None),
-):
-    auth = _bearer_or_401(authorization)
-    projectId = _effective_project_id(projectId)
-
-    url = f"{ACONEX_BASE}/projects/{projectId}/register/{documentId}/file"
+async def download_file(projectId: Optional[str] = None, documentId: str = ""):
+    token = await _get_access_token()
+    pid = _effective_project_id(projectId)
+    url = f"{ACONEX_BASE}/projects/{pid}/register/{documentId}/file"
     upstream = requests.get(
-        url, headers={"Authorization": auth}, stream=True, timeout=300
+        url, headers={"Authorization": f"Bearer {token}"},
+        stream=True, timeout=300
     )
-
-    # Nombre de archivo si viene en Content-Disposition
     fname = None
     disp = upstream.headers.get("Content-Disposition") or ""
     if "filename=" in disp:
@@ -221,10 +187,9 @@ def download_file(
             fname = disp.split("filename=", 1)[1].strip("\"'; ")
         except Exception:
             fname = None
-
     media = upstream.headers.get("Content-Type") or "application/octet-stream"
     return StreamingResponse(
-        upstream.iter_content(chunk_size=64 * 1024),
+        upstream.iter_content(64 * 1024),
         media_type=media,
         headers={
             "Content-Disposition": f'attachment; filename="{fname or (documentId + ".bin")}"'
