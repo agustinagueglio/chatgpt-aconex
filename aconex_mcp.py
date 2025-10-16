@@ -117,6 +117,8 @@ async def oauth_token(request: Request):
 # Endpoints del conector
 # ==========================
 @app.get("/search_register")
+@app.get("/search_register/")
+@app.get("/searchRegister")       # alias por si el cliente llama en camelCase
 def search_register(
     projectId: str | None = Query(default=None),
     page_number: int = 1,
@@ -139,8 +141,10 @@ def search_register(
 
     url = f"{ACONEX_BASE}/projects/{projectId}/register"
     resp = requests.get(
-        url, headers={"Authorization": auth, "Accept": "application/json"},
-        params=params, timeout=60
+        url,
+        headers={"Authorization": auth, "Accept": "application/json"},
+        params=params,
+        timeout=60,
     )
     return _as_json(resp)
 
